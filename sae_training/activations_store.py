@@ -1,5 +1,6 @@
 import os
 from typing import Any, Iterator, cast
+import tqdm
 
 import torch
 from datasets import (
@@ -52,6 +53,7 @@ class ActivationsStore:
             raise ValueError(
                 "Dataset must have a 'tokens', 'input_ids', or 'text' column."
             )
+        self.n_dataset_processed = 0
         self.iterable_dataset = iter(self.dataset)  # Reset iterator after checking
 
         if self.cfg.use_cached_activations:  # EDIT: load from multi-layer acts
@@ -322,6 +324,7 @@ class ActivationsStore:
 
         return dataloader
 
+
     def next_batch(self):
         """
         Get the next batch from the current DataLoader.
@@ -334,6 +337,38 @@ class ActivationsStore:
             # If the DataLoader is exhausted, create a new one
             self.dataloader = self.get_data_loader()
             return next(self.dataloader)
+    @classmethod
+    def load_from_pretrained(cls,
+        file_path: str,
+        cfg: Any,
+        model: HookedRootModule,
+        dataset: HfDataset | None = None,
+        create_dataloader: bool = True,
+    ):
+        activation_store = cls(cfg=cfg,
+                               model=model,
+                               dataset=dataset,
+                               create_dataloader=create_dataloader)
+
+        with open(file_path, "rb") as f:
+            data = torch.load(f)
+            activation_store.storage_buffer = data['storage_buffer']
+            n_dataset_processed = data['n_dataset_processed']
+            pbar = tqdm(total=n_dataset_processed-activation_store.n_dataset_processed, desc="Fast forwarding data")
+            while activation_store.n_dataset_processed < n_dataset_processed:
+                next(activation_store.iterable_dataset)
+                pbar.update(1)
+                activation_store.n_dataset_processed += 1
+        return activation_store
+
+    def save(self, file_path):
+        with open(file_path, "wb") as f:
+            data = {
+                'storage_buffer': self.storage_buffer,
+                'n_dataset_processed': self.n_dataset_processed
+            }
+            torch.save(data, f)
+
 
     def _get_next_dataset_tokens(self) -> torch.Tensor:
         device = self.cfg.device
@@ -360,4 +395,5 @@ class ActivationsStore:
                 and tokens[0] == self.model.tokenizer.bos_token_id  # type: ignore
             ):
                 tokens = tokens[1:]
+        self.n_dataset_processed += 1
         return tokens

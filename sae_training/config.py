@@ -2,6 +2,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Optional, cast
 from transformer_lens import HookedTransformer
+import os
 
 import torch
 
@@ -41,6 +42,7 @@ class RunnerConfig(ABC):
     device: str | torch.device = "cpu"
     seed: int = 42
     dtype: torch.dtype = torch.float32
+    resume: bool = False
 
     def __post_init__(self):
         # Autofill cached_activations_path unless the user overrode it
@@ -48,7 +50,6 @@ class RunnerConfig(ABC):
             self.cached_activations_path = f"activations/{self.dataset_path.replace('/', '_')}/{self.model_name.replace('/', '_')}/{self.hook_point}"
             if self.hook_point_head_index is not None:
                 self.cached_activations_path += f"_{self.hook_point_head_index}"
-
 
 @dataclass
 class LanguageModelSAERunnerConfig(RunnerConfig):
@@ -85,6 +86,7 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
     # WANDB
     log_to_wandb: bool = True
     wandb_project: str = "mats_sae_training_language_model"
+    wandb_id: Optional[str] = None
     run_name: Optional[str] = None
     wandb_entity: Optional[str] = None
     wandb_log_frequency: int = 10
@@ -121,9 +123,12 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
         if self.lr_end is None:
             self.lr_end = self.lr / 10
 
-        unique_id = cast(
-            Any, wandb
-        ).util.generate_id()  # not sure why this type is erroring
+        if self.wandb_id is None:
+            unique_id = cast(
+                Any, wandb
+            ).util.generate_id()  # not sure why this type is erroring
+        else:
+            unique_id = self.wandb_id
         self.checkpoint_path = f"{self.checkpoint_path}/{unique_id}"
 
         if self.verbose:
@@ -168,6 +173,32 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
         if self.use_ghost_grads:
             print("Using Ghost Grads.")
 
+    def get_name(self):
+        layers = self.hook_point_layer
+        if not isinstance(layers, list):
+            layers = [layers]
+        if len(layers) > 1:
+            layer_string = f"{min(layers)-max(layers)}"
+        else:
+            layer_string = f"{layers[0]}"
+        sae_name = f"sae_group_{self.model_name.replace('/', '_')}_{self.hook_point.format(layer=layer_string)}_{self.d_sae}"
+        return sae_name
+
+    def get_base_path(self, checkpoint_name):
+        return f"{self.checkpoint_path}/{checkpoint_name}_{self.get_name()}"
+
+    def get_resume_base_path(self):
+        checkpoints = [f for f in os.listdir(self.checkpoint_path) if os.isfile(os.join(self.checkpoint_path, f))]
+        mapped_to_steps = {}
+        for c in checkpoints:
+            steps = int(c.split("_")[0])
+            mapped_to_steps[steps].append(c)
+        if len(mapped_to_steps) == 0:
+            raise ValueError("no checkpoints available to resume from")
+        else:
+            max_step = max(list(mapped_to_steps.keys()))
+            print(f"resuming from step {max_step}")
+            return self.get_base_path(checkpoint_name=max_step)
 
 @dataclass
 class CacheActivationsRunnerConfig(RunnerConfig):

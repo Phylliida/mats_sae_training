@@ -129,15 +129,7 @@ class SAEGroup:
         print(f"Saved model to {path}")
 
     def get_name(self):
-        layers = self.cfg.hook_point_layer
-        if not isinstance(layers, list):
-            layers = [layers]
-        if len(layers) > 1:
-            layer_string = f"{min(layers)-max(layers)}"
-        else:
-            layer_string = f"{layers[0]}"
-        sae_name = f"sae_group_{self.cfg.model_name.replace('/', '_')}_{self.cfg.hook_point.format(layer=layer_string)}_{self.cfg.d_sae}"
-        return sae_name
+        return self.cfg.get_name()
 
     def eval(self):
         for ae in self.autoencoders:
@@ -146,3 +138,4 @@ class SAEGroup:
     def train(self):
         for ae in self.autoencoders:
             ae.train()
+
