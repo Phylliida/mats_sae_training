@@ -11,6 +11,7 @@ from transformer_lens import HookedTransformer
 from transformer_lens.hook_points import HookedRootModule
 import signal
 import pickle
+import os
 import wandb
 from sae_training.activations_store import ActivationsStore, HfDataset
 from sae_training.evals import run_evals
@@ -68,7 +69,7 @@ class SAETrainingRunState:
         torch.random.set_rng_state(self.torch_state)
         torch.cuda.set_rng_state_all(self.torch_cuda_state)
         np.random.set_state(self.numpy_state)
-        random.setstate(self.random_State)
+        random.setstate(self.random_state)
 
 @dataclass
 class TrainSAEGroupOutput:
@@ -82,7 +83,6 @@ def train_sae_on_language_model(
     sae_group: SAEGroup,
     activation_store: ActivationsStore,
     batch_size: int = 1024,
-    n_checkpoints: int = 0,
     feature_sampling_window: int = 1000,  # how many training steps between resampling the features / considiring neurons dead
     dead_feature_threshold: float = 1e-8,  # how infrequently a feature has to be active to be considered dead
     use_wandb: bool = False,
@@ -96,7 +96,6 @@ def train_sae_on_language_model(
         sae_group,
         activation_store,
         batch_size,
-        n_checkpoints,
         feature_sampling_window,
         use_wandb,
         wandb_log_frequency,
@@ -108,9 +107,7 @@ def train_sae_group_on_language_model(
     sae_group: SAEGroup,
     activation_store: ActivationsStore,
     training_run_state: Optional[SAETrainingRunState] = None,
-    resume: bool = False,
     batch_size: int = 1024,
-    n_checkpoints: int = 0,
     feature_sampling_window: int = 1000,  # how many training steps between resampling the features / considiring neurons dead
     use_wandb: bool = False,
     wandb_log_frequency: int = 50,
@@ -120,19 +117,13 @@ def train_sae_group_on_language_model(
     n_training_steps = 0
     n_training_tokens = 0
 
-    checkpoint_thresholds = []
-    if n_checkpoints > 0:
-        checkpoint_thresholds = list(
-            range(0, total_training_tokens, total_training_tokens // n_checkpoints)
-        )[1:]
-
     all_layers = sae_group.cfg.hook_point_layer
     if not isinstance(all_layers, list):
         all_layers = [all_layers]
 
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     
-    if not training_run_state is None:
+    if training_run_state is None:
         train_contexts = [
             _build_train_context(sae, total_training_steps) for sae in sae_group
         ]
@@ -141,16 +132,16 @@ def train_sae_group_on_language_model(
         n_training_tokens = training_run_state.n_training_tokens
         n_training_steps = training_run_state.n_training_steps
         pbar.update(n_training_tokens)
+        if not sae_group.cfg.resume:
+            print("warning: you are passing in training run state but resume=False, is that intended?")
     
-    if resume:
+    if sae_group.cfg.resume:
         training_run_state.set_random_state()
     else:
         _init_sae_group_b_decs(sae_group, activation_store, all_layers)
 
     checkpoint_paths: list[str] = []
 
-
-    
     class InterruptedException(Exception):
         pass
 
@@ -214,7 +205,7 @@ def train_sae_group_on_language_model(
                             sparse_autoencoder.train()
 
             # checkpoint if at checkpoint frequency
-            if n_training_steps == 0 or (checkpoint_thresholds and n_training_tokens > checkpoint_thresholds[0]):
+            if n_training_steps % sae_group.cfg.checkpoint_every == 0:
                 checkpoint_path = _save_checkpoint(
                     sae_group,
                     activation_store,
@@ -223,8 +214,6 @@ def train_sae_group_on_language_model(
                     train_contexts=train_contexts,
                     checkpoint_name=n_training_tokens,
                 ).path
-                checkpoint_paths.append(checkpoint_path)
-                checkpoint_thresholds.pop(0)
 
             ###############
 
@@ -244,6 +233,7 @@ def train_sae_group_on_language_model(
             train_contexts=train_contexts,
             checkpoint_name=checkpoint_name,
         ).path
+        print("done saving")
         raise
         
     # save final sae group to checkpoints folder
@@ -492,6 +482,7 @@ def _build_train_step_log_dict(
 class SaveCheckpointOutput(NamedTuple):
     path: str
     activation_store_path: str
+    training_run_state_path: str
     log_feature_sparsity_path: str
     log_feature_sparsities: list[torch.Tensor]
 
@@ -535,19 +526,20 @@ def _save_checkpoint(
     checkpoint_name: int | str,
     wandb_aliases: list[str] | None = None,
 ) -> SaveCheckpointOutput:
+    base_path = sae_group.cfg.get_base_path(checkpoint_name)
     path = (
-        f'{sae_group.cfg.get_base_path()}{SAVE_POSTFIX_SAE_GROUP}.pt'
+        f'{base_path}{SAVE_POSTFIX_SAE_GROUP}.pt'
     )
     for sae in sae_group:
         sae.set_decoder_norm_to_unit_norm()
     sae_group.save_model(path)
-    log_feature_sparsity_path = f"{sae_group.cfg.get_base_path()}{SAVE_POSTFIX_LOG_FEATURE_SPARSITY}.pt"
+    log_feature_sparsity_path = f"{base_path}{SAVE_POSTFIX_LOG_FEATURE_SPARSITY}.pt"
     log_feature_sparsities = [
         _log_feature_sparsity(ctx.feature_sparsity) for ctx in train_contexts
     ]
     torch.save(log_feature_sparsities, log_feature_sparsity_path)
 
-    activation_store_path = f"{sae_group.cfg.get_base_path()}{SAVE_POSTFIX_ACTIVATION_STORE}.pt"
+    activation_store_path = f"{base_path}{SAVE_POSTFIX_ACTIVATION_STORE}.pt"
     activation_store.save(activation_store_path)
 
     training_run_state = SAETrainingRunState(
@@ -556,11 +548,12 @@ def _save_checkpoint(
         n_training_tokens=n_training_tokens
     )
     
-    training_run_path = f"{sae_group.cfg.get_base_path()}{SAVE_POSTFIX_TRAINING_STATE}.pt"
-    with open(training_run_path, "wb") as f:
+    training_run_state_path = f"{base_path}{SAVE_POSTFIX_TRAINING_STATE}.pt"
+    with open(training_run_state_path, "wb") as f:
         pickle.dump(training_run_state, f)
     
     if sae_group.cfg.log_to_wandb:
+        '''
         model_artifact = wandb.Artifact(
             f"{sae_group.get_name()}",
             type="model",
@@ -568,6 +561,7 @@ def _save_checkpoint(
         )
         model_artifact.add_file(path)
         wandb.log_artifact(model_artifact, aliases=wandb_aliases)
+        '''
 
         sparsity_artifact = wandb.Artifact(
             f"{sae_group.get_name()}_log_feature_sparsity",
@@ -576,7 +570,8 @@ def _save_checkpoint(
         )
         sparsity_artifact.add_file(log_feature_sparsity_path)
         wandb.log_artifact(sparsity_artifact)
-        
+        # too large
+        '''
         activation_store_artifact = wandb.Artifact(
             f"{sae_group.get_name()}_activation_store",
             type="activation_store",
@@ -584,9 +579,33 @@ def _save_checkpoint(
         )
         activation_store_artifact.add_file(activation_store_path)
         wandb.log_artifact(activation_store_artifact)
+        # this is large because the optimizer state has a variable for every parameter
+        training_run_state_artifact = wandb.Artifact(
+            f"{sae_group.get_name()}_training_run_state",
+            type="training_run_state",
+            metadata=dict(sae_group.cfg.__dict__),
+        )
+        training_run_state_artifact.add_file(training_run_state_path)
+        wandb.log_artifact(training_run_state_artifact)
+        '''
+    remove_excess_checkpoints(sae_group.cfg)
+    return SaveCheckpointOutput(
+        path=path,
+        activation_store_path=activation_store_path,
+        training_run_state_path=training_run_state_path,
+        log_feature_sparsity_path=log_feature_sparsity_path,
+        log_feature_sparsities=log_feature_sparsities
+    )
 
-    return SaveCheckpointOutput(path, activation_store_path, log_feature_sparsity_path, log_feature_sparsities)
-
+def remove_excess_checkpoints(cfg : Any):
+    checkpoints = cfg.get_checkpoints_by_step()
+    sorted_keys = sorted(list(checkpoints.keys()))
+    if not cfg.max_checkpoints is None:
+        checkpoints_removing = sorted_keys[:-cfg.max_checkpoints]
+        for k in checkpoints_removing:
+            for f in checkpoints[k]:
+                print(f"removing checkpoint file {k}")
+                os.remove(f)
 
 def _log_feature_sparsity(
     feature_sparsity: torch.Tensor, eps: float = 1e-10

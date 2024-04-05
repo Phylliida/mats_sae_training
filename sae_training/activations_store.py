@@ -354,7 +354,7 @@ class ActivationsStore:
             data = torch.load(f)
             activation_store.storage_buffer = data['storage_buffer']
             n_dataset_processed = data['n_dataset_processed']
-            pbar = tqdm(total=n_dataset_processed-activation_store.n_dataset_processed, desc="Fast forwarding data")
+            pbar = tqdm.tqdm(total=n_dataset_processed-activation_store.n_dataset_processed, desc="Fast forwarding data")
             while activation_store.n_dataset_processed < n_dataset_processed:
                 next(activation_store.iterable_dataset)
                 pbar.update(1)

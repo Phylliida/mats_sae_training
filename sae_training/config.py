@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, cast
 from transformer_lens import HookedTransformer
 import os
+from collections import defaultdict
 
 import torch
 
@@ -92,8 +93,9 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
     wandb_log_frequency: int = 10
 
     # Misc
-    n_checkpoints: int = 0
+    checkpoint_every: int = 0
     checkpoint_path: str = "checkpoints"
+    max_checkpoints: Optional[int] = None
     prepend_bos: bool = True
     verbose: bool = True
     model_kwargs: dict = field(default_factory=dict)
@@ -186,15 +188,23 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
 
     def get_base_path(self, checkpoint_name):
         return f"{self.checkpoint_path}/{checkpoint_name}_{self.get_name()}"
+    
+    def get_checkpoints_by_step(self):
+        checkpoints = [f for f in os.listdir(self.checkpoint_path) if os.path.isfile(os.path.join(self.checkpoint_path, f))]
+        mapped_to_steps = defaultdict(lambda: [])
+        for c in checkpoints:
+            pieces = c.split("_")
+            steps = int(pieces[0])
+            full_path = os.path.join(self.checkpoint_path, c)
+            # there might be other saes here, ignore them
+            if full_path.startswith(self.get_base_path(checkpoint_name=steps)):
+                mapped_to_steps[steps].append(full_path)
+        return mapped_to_steps
 
     def get_resume_base_path(self):
-        checkpoints = [f for f in os.listdir(self.checkpoint_path) if os.isfile(os.join(self.checkpoint_path, f))]
-        mapped_to_steps = {}
-        for c in checkpoints:
-            steps = int(c.split("_")[0])
-            mapped_to_steps[steps].append(c)
+        mapped_to_steps = self.get_checkpoints_by_step()
         if len(mapped_to_steps) == 0:
-            raise ValueError("no checkpoints available to resume from")
+            raise FileNotFoundError("no checkpoints available to resume from")
         else:
             max_step = max(list(mapped_to_steps.keys()))
             print(f"resuming from step {max_step}")
