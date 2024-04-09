@@ -12,6 +12,7 @@ from transformer_lens.hook_points import HookedRootModule
 import signal
 import pickle
 import os
+import copy
 import wandb
 from sae_training.activations_store import ActivationsStore, HfDataset
 from sae_training.evals import run_evals
@@ -417,7 +418,7 @@ def _train_step(
         # Calculate the sparsities, and add it to a list, calculate sparsity metrics
         ctx.act_freq_scores += (feature_acts.abs() > 0).float().sum(0)
         ctx.n_frac_active_tokens += batch_size
-
+    
     ctx.optimizer.zero_grad()
     loss.backward()
     sparse_autoencoder.remove_gradient_parallel_to_decoder_directions()
@@ -504,10 +505,20 @@ def resume_checkpoint(
     )
     with open(f'{base_path}{SAVE_POSTFIX_TRAINING_STATE}.pt', 'rb') as f:
         training_run_state = pickle.load(f)
-    
+
+    # the optimizers aren't attached to saes anymore, fix that
+    for ctx, sae in zip(training_run_state.train_contexts, sae_group.autoencoders):
+        attached_optimizer = Adam(sae.parameters(), lr=cfg.lr)
+        attached_optimizer.load_state_dict(ctx.optimizer.state_dict())
+        del ctx.optimizer
+        ctx.optimizer = attached_optimizer
+        # cleanup memory since that was two optimizers
+        torch.cuda.empty_cache()
+
     # overwrite the cfg with a new cfg in case we want to change things
     sae_group.cfg = cfg
     activation_store.cfg = cfg
+    # individual saes don't get new cfgs, maybe they should idk its messy bc of _init_autoencoders stuff
 
     return sae_group, activation_store, training_run_state
 
