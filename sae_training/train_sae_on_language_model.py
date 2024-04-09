@@ -564,7 +564,7 @@ def _save_checkpoint(
         pickle.dump(training_run_state, f)
     
     if sae_group.cfg.log_to_wandb:
-        if checkpoint_name.startswith("final"):
+        if str(checkpoint_name).startswith("final"):
             model_artifact = wandb.Artifact(
                 f"{sae_group.get_name()}",
                 type="model",
