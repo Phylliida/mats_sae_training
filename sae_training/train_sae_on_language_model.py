@@ -492,6 +492,7 @@ def resume_checkpoint(
     base_path: str,
     cfg: Any,
     model: HookedRootModule,
+    batch_size: int,
     dataset: HfDataset | None = None,
     create_dataloader: bool = True,
 ) -> tuple[SAEGroup, ActivationsStore, SAETrainingRunState]:
@@ -506,12 +507,19 @@ def resume_checkpoint(
     with open(f'{base_path}{SAVE_POSTFIX_TRAINING_STATE}.pt', 'rb') as f:
         training_run_state = pickle.load(f)
 
+    total_training_tokens = sae_group.cfg.total_training_tokens
+    total_training_steps = total_training_tokens // batch_size
+    
     # the optimizers aren't attached to saes anymore, fix that
+    # also the scheduler should be attached to them
     for ctx, sae in zip(training_run_state.train_contexts, sae_group.autoencoders):
-        attached_optimizer = Adam(sae.parameters(), lr=cfg.lr)
-        attached_optimizer.load_state_dict(ctx.optimizer.state_dict())
+        attached_context = _build_train_context(sae, total_training_steps=total_training_steps)
+        attached_context.scheduler.load_state_dict(ctx.scheduler.state_dict())
+        attached_context.optimizer.load_state_dict(ctx.optimizer.state_dict())
         del ctx.optimizer
-        ctx.optimizer = attached_optimizer
+        del ctx.scheduler
+        ctx.optimizer = attached_context.optimizer
+        ctx.scheduler = attached_context.scheduler
         # cleanup memory since that was two optimizers
         torch.cuda.empty_cache()
 

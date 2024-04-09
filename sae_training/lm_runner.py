@@ -20,7 +20,8 @@ def language_model_sae_runner(cfg: LanguageModelSAERunnerConfig):
             sparse_autoencoder, activations_loader, training_run_state = resume_checkpoint(
                 base_path=base_path,
                 cfg=cfg,
-                model=model
+                model=model,
+                batch_size=cfg.train_batch_size,
             )
         except FileNotFoundError:
             print(traceback.format_exc())
@@ -53,7 +54,7 @@ def language_model_sae_runner(cfg: LanguageModelSAERunnerConfig):
         training_run_state=training_run_state,
         batch_size=cfg.train_batch_size,
         feature_sampling_window=cfg.feature_sampling_window,
-        use_wandb=cfg.log_to_wandb,
+        use_wandb=cfg.log_to_wandb, 
         wandb_log_frequency=cfg.wandb_log_frequency,
     )
 
