@@ -244,7 +244,7 @@ def train_sae_group_on_language_model(
         n_training_steps=n_training_steps,
         n_training_tokens=n_training_tokens,
         train_contexts=train_contexts,
-        checkpoint_name="final",
+        checkpoint_name=f"final_{n_training_tokens}",
         wandb_aliases=["final_model"],
     )
     checkpoint_paths.append(final_checkpoint.path)
@@ -564,15 +564,14 @@ def _save_checkpoint(
         pickle.dump(training_run_state, f)
     
     if sae_group.cfg.log_to_wandb:
-        '''
-        model_artifact = wandb.Artifact(
-            f"{sae_group.get_name()}",
-            type="model",
-            metadata=dict(sae_group.cfg.__dict__),
-        )
-        model_artifact.add_file(path)
-        wandb.log_artifact(model_artifact, aliases=wandb_aliases)
-        '''
+        if checkpoint_name.startswith("final"):
+            model_artifact = wandb.Artifact(
+                f"{sae_group.get_name()}",
+                type="model",
+                metadata=dict(sae_group.cfg.__dict__),
+            )
+            model_artifact.add_file(path)
+            wandb.log_artifact(model_artifact, aliases=wandb_aliases)
 
         sparsity_artifact = wandb.Artifact(
             f"{sae_group.get_name()}_log_feature_sparsity",
@@ -609,7 +608,7 @@ def _save_checkpoint(
     )
 
 def remove_excess_checkpoints(cfg : Any):
-    checkpoints = cfg.get_checkpoints_by_step()
+    checkpoints, is_done = cfg.get_checkpoints_by_step()
     sorted_keys = sorted(list(checkpoints.keys()))
     if not cfg.max_checkpoints is None:
         checkpoints_removing = sorted_keys[:-cfg.max_checkpoints]

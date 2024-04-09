@@ -190,19 +190,26 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
         return f"{self.checkpoint_path}/{checkpoint_name}_{self.get_name()}"
     
     def get_checkpoints_by_step(self):
+        is_done = False
         checkpoints = [f for f in os.listdir(self.checkpoint_path) if os.path.isfile(os.path.join(self.checkpoint_path, f))]
         mapped_to_steps = defaultdict(lambda: [])
         for c in checkpoints:
             pieces = c.split("_")
-            steps = int(pieces[0])
+            if pieces[0] == 'final':
+                steps = int(pieces[1])
+                is_done = True
+            else:
+                steps = int(pieces[0])
             full_path = os.path.join(self.checkpoint_path, c)
             # there might be other saes here, ignore them
             if full_path.startswith(self.get_base_path(checkpoint_name=steps)):
                 mapped_to_steps[steps].append(full_path)
-        return mapped_to_steps
+        return mapped_to_steps, is_done
 
     def get_resume_base_path(self):
-        mapped_to_steps = self.get_checkpoints_by_step()
+        mapped_to_steps, is_done = self.get_checkpoints_by_step()
+        if is_done:
+            raise StopIteration("Finished training model")
         if len(mapped_to_steps) == 0:
             raise FileNotFoundError("no checkpoints available to resume from")
         else:
