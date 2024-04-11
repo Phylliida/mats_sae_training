@@ -11,7 +11,7 @@ from sae_training.utils import shuffle_activations_pairwise
 
 
 def cache_activations_runner(cfg: CacheActivationsRunnerConfig):
-    model = cfg.model_class.from_pretrained(cfg.model_name)
+    model = HookedTransformer.from_pretrained(cfg.model_name)
     model.to(cfg.device)
     activations_store = ActivationsStore(cfg, model, create_dataloader=False)
 

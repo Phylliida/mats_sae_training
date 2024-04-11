@@ -1,6 +1,5 @@
 import os
 from typing import Any, Iterator, cast
-import tqdm
 
 import torch
 from datasets import (
@@ -11,7 +10,7 @@ from datasets import (
     load_dataset,
 )
 from torch.utils.data import DataLoader
-from transformer_lens.hook_points import HookedRootModule
+from transformer_lens import HookedTransformer
 
 HfDataset = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 
@@ -25,7 +24,7 @@ class ActivationsStore:
     def __init__(
         self,
         cfg: Any,
-        model: HookedRootModule,
+        model: HookedTransformer,
         dataset: HfDataset | None = None,
         create_dataloader: bool = True,
     ):
@@ -53,7 +52,6 @@ class ActivationsStore:
             raise ValueError(
                 "Dataset must have a 'tokens', 'input_ids', or 'text' column."
             )
-        self.n_dataset_processed = 0
         self.iterable_dataset = iter(self.dataset)  # Reset iterator after checking
 
         if self.cfg.use_cached_activations:  # EDIT: load from multi-layer acts
@@ -167,24 +165,14 @@ class ActivationsStore:
             if isinstance(self.cfg.hook_point_layer, list)
             else [self.cfg.hook_point_layer]
         )
-
         act_names = [self.cfg.hook_point.format(layer=layer) for layer in layers]
         hook_point_max_layer = max(layers)
-
-        #if not hasattr(self, "compiled_model_forward") or self.compiled_model_forward is None:
-        #    print("compiling model")
-        #    self.compiled_model_forward = torch.compile(get_activationsf, mode="reduce-overhead")
-        #    print("done compiling model")
-        
-        #print("running model")
         layerwise_activations = self.model.run_with_cache(
-                batch_tokens,
-                names_filter=act_names,
-                stop_at_layer=hook_point_max_layer + 1,
-                prepend_bos=self.cfg.prepend_bos,
-                **self.cfg.model_kwargs,
-            )[1]
-        #print("done running model")
+            batch_tokens,
+            names_filter=act_names,
+            stop_at_layer=hook_point_max_layer + 1,
+            prepend_bos=self.cfg.prepend_bos,
+        )[1]
         activations_list = [layerwise_activations[act_name] for act_name in act_names]
         if self.cfg.hook_point_head_index is not None:
             activations_list = [
@@ -199,7 +187,6 @@ class ActivationsStore:
         # Stack along a new dimension to keep separate layers distinct
         stacked_activations = torch.stack(activations_list, dim=2)
 
-        #print("done rest")
         return stacked_activations
 
     def get_buffer(self, n_batches_in_buffer: int):
@@ -324,7 +311,6 @@ class ActivationsStore:
 
         return dataloader
 
-
     def next_batch(self):
         """
         Get the next batch from the current DataLoader.
@@ -337,38 +323,6 @@ class ActivationsStore:
             # If the DataLoader is exhausted, create a new one
             self.dataloader = self.get_data_loader()
             return next(self.dataloader)
-    @classmethod
-    def load_from_pretrained(cls,
-        file_path: str,
-        cfg: Any,
-        model: HookedRootModule,
-        dataset: HfDataset | None = None,
-        create_dataloader: bool = True,
-    ):
-        activation_store = cls(cfg=cfg,
-                               model=model,
-                               dataset=dataset,
-                               create_dataloader=create_dataloader)
-
-        with open(file_path, "rb") as f:
-            data = torch.load(f)
-            activation_store.storage_buffer = data['storage_buffer']
-            n_dataset_processed = data['n_dataset_processed']
-            pbar = tqdm.tqdm(total=n_dataset_processed-activation_store.n_dataset_processed, desc="Fast forwarding data")
-            while activation_store.n_dataset_processed < n_dataset_processed:
-                next(activation_store.iterable_dataset)
-                pbar.update(1)
-                activation_store.n_dataset_processed += 1
-        return activation_store
-
-    def save(self, file_path):
-        with open(file_path, "wb") as f:
-            data = {
-                'storage_buffer': self.storage_buffer,
-                'n_dataset_processed': self.n_dataset_processed
-            }
-            torch.save(data, f)
-
 
     def _get_next_dataset_tokens(self) -> torch.Tensor:
         device = self.cfg.device
@@ -395,5 +349,4 @@ class ActivationsStore:
                 and tokens[0] == self.model.tokenizer.bos_token_id  # type: ignore
             ):
                 tokens = tokens[1:]
-        self.n_dataset_processed += 1
         return tokens

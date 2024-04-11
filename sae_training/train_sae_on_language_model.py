@@ -1,20 +1,14 @@
-from dataclasses import dataclass, field
-from typing import Any, NamedTuple, cast, Optional
+from dataclasses import dataclass
+from typing import Any, NamedTuple, cast
 
 import torch
 from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-import numpy as np
-import random
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
-from transformer_lens.hook_points import HookedRootModule
-import signal
-import pickle
-import os
-import copy
+
 import wandb
-from sae_training.activations_store import ActivationsStore, HfDataset
+from sae_training.activations_store import ActivationsStore
 from sae_training.evals import run_evals
 from sae_training.geometric_median import compute_geometric_median
 from sae_training.optim import get_scheduler
@@ -40,39 +34,6 @@ class SAETrainContext:
 
 
 @dataclass
-class SAETrainingRunState:
-    """
-    Training run state for all SAES
-    Also includes n_training_steps
-    n_training_tokens
-    and rng states
-    """
-
-    train_contexts: list[SAETrainContext]
-    n_training_steps : int = 0
-    n_training_tokens : int = 0
-    torch_state: Optional[torch.ByteTensor] = None
-    torch_cuda_state: Optional[torch.ByteTensor] = None
-    numpy_state: Optional[np.ndarray] = None
-    random_state: Optional[Any] = None
-
-    def __post_init__(self):
-        if self.torch_state is None:
-            self.torch_state = torch.get_rng_state()
-        if self.torch_cuda_state is None:
-            self.torch_cuda_state = torch.cuda.get_rng_state_all() 
-        if self.numpy_state is None:
-            self.numpy_state = np.random.get_state()
-        if self.random_state is None:
-            self.random_state = random.getstate()
-
-    def set_random_state(self):
-        torch.random.set_rng_state(self.torch_state)
-        torch.cuda.set_rng_state_all(self.torch_cuda_state)
-        np.random.set_state(self.numpy_state)
-        random.setstate(self.random_state)
-
-@dataclass
 class TrainSAEGroupOutput:
     sae_group: SAEGroup
     checkpoint_paths: list[str]
@@ -84,6 +45,7 @@ def train_sae_on_language_model(
     sae_group: SAEGroup,
     activation_store: ActivationsStore,
     batch_size: int = 1024,
+    n_checkpoints: int = 0,
     feature_sampling_window: int = 1000,  # how many training steps between resampling the features / considiring neurons dead
     dead_feature_threshold: float = 1e-8,  # how infrequently a feature has to be active to be considered dead
     use_wandb: bool = False,
@@ -97,6 +59,7 @@ def train_sae_on_language_model(
         sae_group,
         activation_store,
         batch_size,
+        n_checkpoints,
         feature_sampling_window,
         use_wandb,
         wandb_log_frequency,
@@ -107,8 +70,8 @@ def train_sae_group_on_language_model(
     model: HookedTransformer,
     sae_group: SAEGroup,
     activation_store: ActivationsStore,
-    training_run_state: Optional[SAETrainingRunState] = None,
     batch_size: int = 1024,
+    n_checkpoints: int = 0,
     feature_sampling_window: int = 1000,  # how many training steps between resampling the features / considiring neurons dead
     use_wandb: bool = False,
     wandb_log_frequency: int = 50,
@@ -118,135 +81,98 @@ def train_sae_group_on_language_model(
     n_training_steps = 0
     n_training_tokens = 0
 
+    checkpoint_thresholds = []
+    if n_checkpoints > 0:
+        checkpoint_thresholds = list(
+            range(0, total_training_tokens, total_training_tokens // n_checkpoints)
+        )[1:]
+
     all_layers = sae_group.cfg.hook_point_layer
     if not isinstance(all_layers, list):
         all_layers = [all_layers]
 
+    train_contexts = [
+        _build_train_context(sae, total_training_steps) for sae in sae_group
+    ]
+    _init_sae_group_b_decs(sae_group, activation_store, all_layers)
+
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
-    
-    if training_run_state is None:
-        train_contexts = [
-            _build_train_context(sae, total_training_steps) for sae in sae_group
-        ]
-    else:
-        train_contexts = training_run_state.train_contexts
-        n_training_tokens = training_run_state.n_training_tokens
-        n_training_steps = training_run_state.n_training_steps
-        pbar.update(n_training_tokens)
-        if not sae_group.cfg.resume:
-            print("warning: you are passing in training run state but resume=False, is that intended?")
-    
-    if sae_group.cfg.resume:
-        training_run_state.set_random_state()
-    else:
-        _init_sae_group_b_decs(sae_group, activation_store, all_layers)
-
     checkpoint_paths: list[str] = []
+    while n_training_tokens < total_training_tokens:
+        # Do a training step.
+        layer_acts = activation_store.next_batch()
+        n_training_tokens += batch_size
 
-    class InterruptedException(Exception):
-        pass
+        mse_losses: list[torch.Tensor] = []
+        l1_losses: list[torch.Tensor] = []
 
-    def interrupt_callback(sig_num, stack_frame):
-        raise InterruptedException() 
-
-    try:
-        signal.signal(signal.SIGINT, interrupt_callback)
-        signal.signal(signal.SIGTERM, interrupt_callback)
-
-        while n_training_tokens < total_training_tokens:
-            # Do a training step.
-            layer_acts = activation_store.next_batch()
-            n_training_tokens += batch_size
-
-            mse_losses: list[torch.Tensor] = []
-            l1_losses: list[torch.Tensor] = []
-
-            for (
-                sparse_autoencoder,
-                ctx,
-            ) in zip(sae_group, train_contexts):
-                wandb_suffix = _wandb_log_suffix(sae_group.cfg, sparse_autoencoder.cfg)
-                step_output = _train_step(
-                    sparse_autoencoder=sparse_autoencoder,
-                    layer_acts=layer_acts,
-                    ctx=ctx,
-                    feature_sampling_window=feature_sampling_window,
-                    use_wandb=use_wandb,
-                    n_training_steps=n_training_steps,
-                    all_layers=all_layers,
-                    batch_size=batch_size,
-                    wandb_suffix=wandb_suffix,
-                )
-                #if (n_training_steps % 50) == 0:
-                #    print("tokens", n_training_tokens)
-                mse_losses.append(step_output.mse_loss)
-                l1_losses.append(step_output.l1_loss)
-                if use_wandb:
-                    with torch.no_grad():
-                        if (n_training_steps + 1) % wandb_log_frequency == 0:
-                            wandb.log(
-                                _build_train_step_log_dict(
-                                    sparse_autoencoder,
-                                    step_output,
-                                    ctx,
-                                    wandb_suffix,
-                                    n_training_tokens,
-                                ),
-                                step=n_training_steps,
-                            )
-
-                        # record loss frequently, but not all the time.
-                        if n_training_steps == 0 or (n_training_steps + 1) % (wandb_log_frequency * 10) == 0:
-                            sparse_autoencoder.eval()
-                            run_evals(
-                                sparse_autoencoder,
-                                activation_store,
-                                model,
-                                n_training_steps,
-                                suffix=wandb_suffix,
-                            )
-                            sparse_autoencoder.train()
-
-            # checkpoint if at checkpoint frequency
-            if n_training_steps % sae_group.cfg.checkpoint_every == 0:
-                checkpoint_path = _save_checkpoint(
-                    sae_group,
-                    activation_store,
-                    n_training_steps=n_training_steps,
-                    n_training_tokens=n_training_tokens,
-                    train_contexts=train_contexts,
-                    checkpoint_name=n_training_tokens,
-                ).path
-
-            ###############
-
-            n_training_steps += 1
-            pbar.set_description(
-                f"{n_training_steps}| MSE Loss {torch.stack(mse_losses).mean().item():.3f} | L1 {torch.stack(l1_losses).mean().item():.3f}"
+        for (
+            sparse_autoencoder,
+            ctx,
+        ) in zip(sae_group, train_contexts):
+            wandb_suffix = _wandb_log_suffix(sae_group.cfg, sparse_autoencoder.cfg)
+            step_output = _train_step(
+                sparse_autoencoder=sparse_autoencoder,
+                layer_acts=layer_acts,
+                ctx=ctx,
+                feature_sampling_window=feature_sampling_window,
+                use_wandb=use_wandb,
+                n_training_steps=n_training_steps,
+                all_layers=all_layers,
+                batch_size=batch_size,
+                wandb_suffix=wandb_suffix,
             )
-            pbar.update(batch_size)
-    except (KeyboardInterrupt, InterruptedException):
-        print("interrupted, saving progress")
-        checkpoint_name = n_training_tokens
-        checkpoint_path = _save_checkpoint(
-            sae_group,
-            activation_store,
-            n_training_steps=n_training_steps,
-            n_training_tokens=n_training_tokens,
-            train_contexts=train_contexts,
-            checkpoint_name=checkpoint_name,
-        ).path
-        print("done saving")
-        raise
-        
+            mse_losses.append(step_output.mse_loss)
+            l1_losses.append(step_output.l1_loss)
+            if use_wandb:
+                with torch.no_grad():
+                    if (n_training_steps + 1) % wandb_log_frequency == 0:
+                        wandb.log(
+                            _build_train_step_log_dict(
+                                sparse_autoencoder,
+                                step_output,
+                                ctx,
+                                wandb_suffix,
+                                n_training_tokens,
+                            ),
+                            step=n_training_steps,
+                        )
+
+                    # record loss frequently, but not all the time.
+                    if (n_training_steps + 1) % (wandb_log_frequency * 10) == 0:
+                        sparse_autoencoder.eval()
+                        run_evals(
+                            sparse_autoencoder,
+                            activation_store,
+                            model,
+                            n_training_steps,
+                            suffix=wandb_suffix,
+                        )
+                        sparse_autoencoder.train()
+
+        # checkpoint if at checkpoint frequency
+        if checkpoint_thresholds and n_training_tokens > checkpoint_thresholds[0]:
+            checkpoint_path = _save_checkpoint(
+                sae_group,
+                train_contexts=train_contexts,
+                checkpoint_name=n_training_tokens,
+            ).path
+            checkpoint_paths.append(checkpoint_path)
+            checkpoint_thresholds.pop(0)
+
+        ###############
+
+        n_training_steps += 1
+        pbar.set_description(
+            f"{n_training_steps}| MSE Loss {torch.stack(mse_losses).mean().item():.3f} | L1 {torch.stack(l1_losses).mean().item():.3f}"
+        )
+        pbar.update(batch_size)
+
     # save final sae group to checkpoints folder
     final_checkpoint = _save_checkpoint(
         sae_group,
-        activation_store,
-        n_training_steps=n_training_steps,
-        n_training_tokens=n_training_tokens,
         train_contexts=train_contexts,
-        checkpoint_name=f"final_{n_training_tokens}",
+        checkpoint_name="final",
         wandb_aliases=["final_model"],
     )
     checkpoint_paths.append(final_checkpoint.path)
@@ -420,7 +346,7 @@ def _train_step(
         # Calculate the sparsities, and add it to a list, calculate sparsity metrics
         ctx.act_freq_scores += (feature_acts.abs() > 0).float().sum(0)
         ctx.n_frac_active_tokens += batch_size
-    
+
     ctx.optimizer.zero_grad()
     loss.backward()
     sparse_autoencoder.remove_gradient_parallel_to_decoder_directions()
@@ -484,104 +410,35 @@ def _build_train_step_log_dict(
 
 class SaveCheckpointOutput(NamedTuple):
     path: str
-    activation_store_path: str
-    training_run_state_path: str
     log_feature_sparsity_path: str
     log_feature_sparsities: list[torch.Tensor]
 
 
-def resume_checkpoint(
-    base_path: str,
-    cfg: Any,
-    model: HookedRootModule,
-    batch_size: int,
-    dataset: HfDataset | None = None,
-    create_dataloader: bool = True,
-) -> tuple[SAEGroup, ActivationsStore, SAETrainingRunState]:
-    sae_group = SAEGroup.load_from_pretrained(f'{base_path}{SAVE_POSTFIX_SAE_GROUP}.pt')
-    activation_store = ActivationsStore.load_from_pretrained(
-        file_path=f'{base_path}{SAVE_POSTFIX_ACTIVATION_STORE}.pt',
-        cfg=cfg,
-        model=model,
-        dataset=dataset,
-        create_dataloader=create_dataloader
-    )
-    with open(f'{base_path}{SAVE_POSTFIX_TRAINING_STATE}.pt', 'rb') as f:
-        training_run_state = pickle.load(f)
-
-    total_training_tokens = sae_group.cfg.total_training_tokens
-    total_training_steps = total_training_tokens // batch_size
-    
-    # the optimizers aren't attached to saes anymore, fix that
-    # also the scheduler should be attached to them
-    for ctx, sae in zip(training_run_state.train_contexts, sae_group.autoencoders):
-        attached_context = _build_train_context(sae, total_training_steps=total_training_steps)
-        attached_context.scheduler.load_state_dict(ctx.scheduler.state_dict())
-        attached_context.optimizer.load_state_dict(ctx.optimizer.state_dict())
-        del ctx.optimizer
-        del ctx.scheduler
-        ctx.optimizer = attached_context.optimizer
-        ctx.scheduler = attached_context.scheduler
-        # cleanup memory since that was two optimizers
-        torch.cuda.empty_cache()
-
-    # overwrite the cfg with a new cfg in case we want to change things
-    sae_group.cfg = cfg
-    activation_store.cfg = cfg
-    # individual saes don't get new cfgs, maybe they should idk its messy bc of _init_autoencoders stuff
-
-    return sae_group, activation_store, training_run_state
-
-
-SAVE_POSTFIX_SAE_GROUP = ''
-SAVE_POSTFIX_LOG_FEATURE_SPARSITY = '_log_feature_sparsity'
-SAVE_POSTFIX_ACTIVATION_STORE = '_activation_store'
-SAVE_POSTFIX_TRAINING_STATE = '_trainining_state'
-
 def _save_checkpoint(
     sae_group: SAEGroup,
-    activation_store: ActivationsStore,
     train_contexts: list[SAETrainContext],
-    n_training_steps : int,
-    n_training_tokens : int,
     checkpoint_name: int | str,
     wandb_aliases: list[str] | None = None,
 ) -> SaveCheckpointOutput:
-    base_path = sae_group.cfg.get_base_path(checkpoint_name)
     path = (
-        f'{base_path}{SAVE_POSTFIX_SAE_GROUP}.pt'
+        f"{sae_group.cfg.checkpoint_path}/{checkpoint_name}_{sae_group.get_name()}.pt"
     )
     for sae in sae_group:
         sae.set_decoder_norm_to_unit_norm()
     sae_group.save_model(path)
-    log_feature_sparsity_path = f"{base_path}{SAVE_POSTFIX_LOG_FEATURE_SPARSITY}.pt"
+    log_feature_sparsity_path = f"{sae_group.cfg.checkpoint_path}/{checkpoint_name}_{sae_group.get_name()}_log_feature_sparsity.pt"
     log_feature_sparsities = [
         _log_feature_sparsity(ctx.feature_sparsity) for ctx in train_contexts
     ]
     torch.save(log_feature_sparsities, log_feature_sparsity_path)
-
-    activation_store_path = f"{base_path}{SAVE_POSTFIX_ACTIVATION_STORE}.pt"
-    activation_store.save(activation_store_path)
-
-    training_run_state = SAETrainingRunState(
-        train_contexts=train_contexts,
-        n_training_steps=n_training_steps,
-        n_training_tokens=n_training_tokens
-    )
-    
-    training_run_state_path = f"{base_path}{SAVE_POSTFIX_TRAINING_STATE}.pt"
-    with open(training_run_state_path, "wb") as f:
-        pickle.dump(training_run_state, f)
-    
     if sae_group.cfg.log_to_wandb:
-        if str(checkpoint_name).startswith("final"):
-            model_artifact = wandb.Artifact(
-                f"{sae_group.get_name()}",
-                type="model",
-                metadata=dict(sae_group.cfg.__dict__),
-            )
-            model_artifact.add_file(path)
-            wandb.log_artifact(model_artifact, aliases=wandb_aliases)
+        model_artifact = wandb.Artifact(
+            f"{sae_group.get_name()}",
+            type="model",
+            metadata=dict(sae_group.cfg.__dict__),
+        )
+        model_artifact.add_file(path)
+        wandb.log_artifact(model_artifact, aliases=wandb_aliases)
 
         sparsity_artifact = wandb.Artifact(
             f"{sae_group.get_name()}_log_feature_sparsity",
@@ -590,42 +447,8 @@ def _save_checkpoint(
         )
         sparsity_artifact.add_file(log_feature_sparsity_path)
         wandb.log_artifact(sparsity_artifact)
-        # too large
-        '''
-        activation_store_artifact = wandb.Artifact(
-            f"{sae_group.get_name()}_activation_store",
-            type="activation_store",
-            metadata=dict(sae_group.cfg.__dict__),
-        )
-        activation_store_artifact.add_file(activation_store_path)
-        wandb.log_artifact(activation_store_artifact)
-        # this is large because the optimizer state has a variable for every parameter
-        training_run_state_artifact = wandb.Artifact(
-            f"{sae_group.get_name()}_training_run_state",
-            type="training_run_state",
-            metadata=dict(sae_group.cfg.__dict__),
-        )
-        training_run_state_artifact.add_file(training_run_state_path)
-        wandb.log_artifact(training_run_state_artifact)
-        '''
-    remove_excess_checkpoints(sae_group.cfg)
-    return SaveCheckpointOutput(
-        path=path,
-        activation_store_path=activation_store_path,
-        training_run_state_path=training_run_state_path,
-        log_feature_sparsity_path=log_feature_sparsity_path,
-        log_feature_sparsities=log_feature_sparsities
-    )
+    return SaveCheckpointOutput(path, log_feature_sparsity_path, log_feature_sparsities)
 
-def remove_excess_checkpoints(cfg : Any):
-    checkpoints, is_done = cfg.get_checkpoints_by_step()
-    sorted_keys = sorted(list(checkpoints.keys()))
-    if not cfg.max_checkpoints is None:
-        checkpoints_removing = sorted_keys[:-cfg.max_checkpoints]
-        for k in checkpoints_removing:
-            for f in checkpoints[k]:
-                print(f"removing checkpoint file {k}")
-                os.remove(f)
 
 def _log_feature_sparsity(
     feature_sparsity: torch.Tensor, eps: float = 1e-10

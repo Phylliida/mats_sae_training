@@ -1,9 +1,6 @@
 from abc import ABC
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional, cast
-from transformer_lens import HookedTransformer
-import os
-from collections import defaultdict
 
 import torch
 
@@ -18,9 +15,7 @@ class RunnerConfig(ABC):
 
     # Data Generating Function (Model + Training Distibuion)
     model_name: str = "gelu-2l"
-    model_class: type = HookedTransformer
     hook_point: str = "blocks.{layer}.hook_mlp_out"
-    hook_point_eval: str = "blocks.0.attn.pattern"
     hook_point_layer: int = 0
     hook_point_head_index: Optional[int] = None
     dataset_path: str = "NeelNanda/c4-tokenized-2b"
@@ -43,7 +38,6 @@ class RunnerConfig(ABC):
     device: str | torch.device = "cpu"
     seed: int = 42
     dtype: torch.dtype = torch.float32
-    resume: bool = False
 
     def __post_init__(self):
         # Autofill cached_activations_path unless the user overrode it
@@ -51,6 +45,7 @@ class RunnerConfig(ABC):
             self.cached_activations_path = f"activations/{self.dataset_path.replace('/', '_')}/{self.model_name.replace('/', '_')}/{self.hook_point}"
             if self.hook_point_head_index is not None:
                 self.cached_activations_path += f"_{self.hook_point_head_index}"
+
 
 @dataclass
 class LanguageModelSAERunnerConfig(RunnerConfig):
@@ -87,18 +82,15 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
     # WANDB
     log_to_wandb: bool = True
     wandb_project: str = "mats_sae_training_language_model"
-    wandb_id: Optional[str] = None
     run_name: Optional[str] = None
     wandb_entity: Optional[str] = None
     wandb_log_frequency: int = 10
 
     # Misc
-    checkpoint_every: int = 0
+    n_checkpoints: int = 0
     checkpoint_path: str = "checkpoints"
-    max_checkpoints: Optional[int] = None
     prepend_bos: bool = True
     verbose: bool = True
-    model_kwargs: dict = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -125,12 +117,9 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
         if self.lr_end is None:
             self.lr_end = self.lr / 10
 
-        if self.wandb_id is None:
-            unique_id = cast(
-                Any, wandb
-            ).util.generate_id()  # not sure why this type is erroring
-        else:
-            unique_id = self.wandb_id
+        unique_id = cast(
+            Any, wandb
+        ).util.generate_id()  # not sure why this type is erroring
         self.checkpoint_path = f"{self.checkpoint_path}/{unique_id}"
 
         if self.verbose:
@@ -175,47 +164,6 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
         if self.use_ghost_grads:
             print("Using Ghost Grads.")
 
-    def get_name(self):
-        layers = self.hook_point_layer
-        if not isinstance(layers, list):
-            layers = [layers]
-        if len(layers) > 1:
-            layer_string = f"{min(layers)-max(layers)}"
-        else:
-            layer_string = f"{layers[0]}"
-        sae_name = f"sae_group_{self.model_name.replace('/', '_')}_{self.hook_point.format(layer=layer_string)}_{self.d_sae}"
-        return sae_name
-
-    def get_base_path(self, checkpoint_name):
-        return f"{self.checkpoint_path}/{checkpoint_name}_{self.get_name()}"
-    
-    def get_checkpoints_by_step(self):
-        is_done = False
-        checkpoints = [f for f in os.listdir(self.checkpoint_path) if os.path.isfile(os.path.join(self.checkpoint_path, f))]
-        mapped_to_steps = defaultdict(lambda: [])
-        for c in checkpoints:
-            pieces = c.split("_")
-            if pieces[0] == 'final':
-                steps = int(pieces[1])
-                is_done = True
-            else:
-                steps = int(pieces[0])
-            full_path = os.path.join(self.checkpoint_path, c)
-            # there might be other saes here, ignore them
-            if full_path.startswith(self.get_base_path(checkpoint_name=steps)):
-                mapped_to_steps[steps].append(full_path)
-        return mapped_to_steps, is_done
-
-    def get_resume_base_path(self):
-        mapped_to_steps, is_done = self.get_checkpoints_by_step()
-        if is_done:
-            raise StopIteration("Finished training model")
-        if len(mapped_to_steps) == 0:
-            raise FileNotFoundError("no checkpoints available to resume from")
-        else:
-            max_step = max(list(mapped_to_steps.keys()))
-            print(f"resuming from step {max_step}")
-            return self.get_base_path(checkpoint_name=max_step)
 
 @dataclass
 class CacheActivationsRunnerConfig(RunnerConfig):
@@ -228,7 +176,6 @@ class CacheActivationsRunnerConfig(RunnerConfig):
     n_shuffles_with_last_section: int = 10
     n_shuffles_in_entire_dir: int = 10
     n_shuffles_final: int = 100
-    model_kwargs: dict = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
