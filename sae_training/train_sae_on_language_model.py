@@ -177,6 +177,8 @@ def train_sae_group_on_language_model(
                     batch_size=batch_size,
                     wandb_suffix=wandb_suffix,
                 )
+                #if (n_training_steps % 50) == 0:
+                #    print("tokens", n_training_tokens)
                 mse_losses.append(step_output.mse_loss)
                 l1_losses.append(step_output.l1_loss)
                 if use_wandb:
